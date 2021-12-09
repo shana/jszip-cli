@@ -46,12 +46,16 @@ export class JSZipCLI {
     this.extractService = new ExtractService(this.options);
   }
 
+  public get value(): BuildService {
+    return this.buildService;
+  }
+
   /**
    * Add files and directories to the ZIP file.
    * @param rawEntries The entries (files, directories) to add.
    * If not specified, entries from configuration file are used.
    */
-  public add(rawEntries?: string[]): BuildService {
+  public async add(rawEntries?: string[]): Promise<BuildService> {
     if (!rawEntries || !rawEntries.length) {
       if (this.options.entries) {
         rawEntries = this.options.entries;
@@ -87,7 +91,7 @@ export class JSZipCLI {
       throw new Error('No configuration file and no mode specified.');
     }
     if (this.options.mode === 'add') {
-      const {outputFile, compressedFilesCount} = await this.add().save();
+      const {outputFile, compressedFilesCount} = await (await this.add()).save();
 
       if (this.options.outputEntry && !this.options.quiet) {
         console.info(`Done compressing ${compressedFilesCount} files to "${outputFile}".`);

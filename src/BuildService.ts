@@ -5,17 +5,19 @@ import * as path from 'path';
 import * as progress from 'progress';
 import {FileService} from './FileService';
 import {Entry, TerminalOptions} from './interfaces';
+import ignore, {Ignore} from 'ignore';
 
 export class BuildService {
   public compressedFilesCount: number;
   public outputFile: string | null;
   private entries: Entry[];
   private readonly fileService: FileService;
-  private readonly ignoreEntries: RegExp[];
+  private readonly ignoreEntries: string[];
   private readonly jszip: JSZip;
   private readonly logger: logdown.Logger;
   private readonly options: Required<TerminalOptions>;
   private readonly progressBar: progress;
+  private readonly ig: Ignore;
 
   constructor(options: Required<TerminalOptions>) {
     this.fileService = new FileService(options);
@@ -27,9 +29,7 @@ export class BuildService {
     });
     this.logger.state = {isEnabled: options.verbose};
     this.entries = [];
-    this.ignoreEntries = this.options.ignoreEntries.map(entry =>
-      entry instanceof RegExp ? entry : new RegExp(entry.replace(/\*/g, '.*'))
-    );
+    this.ignoreEntries = this.options.ignoreEntries;
     this.outputFile = this.options.outputEntry ? path.resolve(this.options.outputEntry) : null;
     this.progressBar = new progress('Compressing [:bar] :percent :elapseds', {
       complete: '=',
@@ -38,18 +38,32 @@ export class BuildService {
       width: 20,
     });
     this.compressedFilesCount = 0;
+    this.ig = ignore().add(this.ignoreEntries);
   }
 
-  public add(rawEntries: string[]): BuildService {
+  public async add(rawEntries: string[]): Promise<BuildService> {
     this.logger.info(`Adding ${rawEntries.length} entr${rawEntries.length === 1 ? 'y' : 'ies'} to ZIP file.`);
-    this.entries = rawEntries.map(rawEntry => {
-      const resolvedPath = path.resolve(rawEntry);
-      const baseName = path.basename(rawEntry);
+
+    this.entries = await Promise.all(
+      rawEntries.map(entry =>
+        this.walkDir2({
+          resolvedPath: path.resolve(entry),
+          zipPath: path.basename(entry),
+        })
+      )
+    ).then(arr => arr.flat());
+
+    this.entries.map(eee => this.logger.info(`${eee.zipPath} ${eee.resolvedPath}`));
+
+    this.entries = this.ig.filter(this.entries.map(entry => entry.zipPath)).map(entry => {
       return {
-        resolvedPath,
-        zipPath: baseName,
+        resolvedPath: path.resolve(entry),
+        zipPath: path.basename(entry),
       };
     });
+
+    this.entries.map(eee => this.logger.info(`${eee.zipPath} ${eee.resolvedPath}`));
+
     return this;
   }
 
@@ -137,15 +151,15 @@ export class BuildService {
       return;
     }
 
-    const ignoreEntries = this.ignoreEntries.filter(ignoreEntry => Boolean(entry.resolvedPath.match(ignoreEntry)));
+    // const ignoreEntries = this.ignoreEntries.filter(ignoreEntry => Boolean(entry.resolvedPath.match(ignoreEntry)));
 
-    if (ignoreEntries.length) {
-      this.logger.info(
-        `Found ${entry.resolvedPath}. Not adding since it's on the ignore list:`,
-        ignoreEntries.map(entry => String(entry))
-      );
-      return;
-    }
+    // if (ignoreEntries.length) {
+    //   this.logger.info(
+    //     `Found ${entry.resolvedPath}. Not adding since it's on the ignore list:`,
+    //     ignoreEntries.map(entry => String(entry))
+    //   );
+    //   return;
+    // }
 
     if (fileStat.isDirectory()) {
       this.logger.info(`Found directory "${entry.resolvedPath}".`);
@@ -220,5 +234,66 @@ export class BuildService {
         zipPath: newZipPath,
       });
     }
+  }
+
+  private async walkDir2(entry: Entry): Promise<Entry[]> {
+    const ret: Entry[] = [];
+    let fileStat: fs.Stats;
+    try {
+      fileStat = await fs.lstat(entry.resolvedPath);
+    } catch (error) {
+      if (!this.options.quiet) {
+        console.info(`Can't read file "${entry.resolvedPath}". Ignoring.`);
+      }
+      this.logger.info(error);
+      return ret;
+    }
+
+    if (fileStat.isDirectory()) {
+      this.logger.info(`Walking directory ${entry.resolvedPath} ...`);
+      const dirEntries = await fs.readdir(entry.resolvedPath);
+      for (const dirEntry of dirEntries) {
+        const newZipPath = entry.zipPath === '.' ? dirEntry : `${entry.zipPath}/${dirEntry}`;
+        const newResolvedPath = path.join(entry.resolvedPath, dirEntry);
+        const newEntry = {
+          resolvedPath: newResolvedPath,
+          zipPath: newZipPath,
+        };
+        ret.push(newEntry);
+        (await this.walkDir2(newEntry)).map(ent => ret.push(ent));
+      }
+      await this.walkDir(entry);
+    } else if (fileStat.isFile()) {
+      this.logger.info(`Resolving file "${entry.resolvedPath}".`);
+      ret.push(entry);
+    } else if (fileStat.isSymbolicLink()) {
+      this.logger.info(`Resolving symbolic link "${entry.resolvedPath}".`);
+      if (this.options.dereferenceLinks) {
+        let realPath: string;
+        try {
+          realPath = await fs.realpath(entry.resolvedPath);
+        } catch (error) {
+          if (!this.options.quiet) {
+            console.info(`Can't read link "${entry.resolvedPath}". Ignoring.`);
+          }
+          this.logger.info(error);
+          return ret;
+        }
+        this.logger.info(`Resolving real path "${realPath} for symbolic link".`);
+        ret.push({
+          resolvedPath: realPath,
+          zipPath: entry.zipPath,
+        });
+      } else {
+        ret.push(entry);
+      }
+    } else {
+      this.logger.info('Unknown file type.', {fileStat});
+      if (!this.options.quiet) {
+        console.info(`Can't read file "${entry.resolvedPath}". Ignoring.`);
+      }
+    }
+
+    return ret;
   }
 }
